@@ -100,23 +100,11 @@ namespace Arbitrer.RabbitMQ
         mandatory: true,
         body: Encoding.UTF8.GetBytes(message),
         basicProperties: GetBasicProperties(correlationId));
-
-
+      
       cancellationToken.Register(() => _callbackMapper.TryRemove(correlationId, out var tmp));
       var result = await tcs.Task;
 
-      if (typeof(TResponse).IsClass)
-        return JsonConvert.DeserializeObject<Messages.ResponseMessage<TResponse>>(result, options.SerializerSettings);
-
-      var r = JsonConvert.DeserializeObject<Messages.ResponseMessage>(result, options.SerializerSettings);
-      if (r.Content != null)
-        r.Content = (r.Content as JToken).ToObject<TResponse>();
-      return new ResponseMessage<TResponse>()
-      {
-        Status = r.Status,
-        Exception =  r.Exception,
-        Content = (TResponse) (r.Content ?? default(TResponse))
-      };
+      return JsonConvert.DeserializeObject<Messages.ResponseMessage<TResponse>>(result, options.SerializerSettings);
     }
 
     public async Task Notify<TRequest>(TRequest request, CancellationToken cancellationToken = default) where TRequest : INotification
@@ -139,7 +127,6 @@ namespace Arbitrer.RabbitMQ
       var props = _sendChannel.CreateBasicProperties();
       props.CorrelationId = correlationId;
       props.ReplyTo = _replyQueueName;
-      ;
       return props;
     }
 
@@ -148,7 +135,7 @@ namespace Arbitrer.RabbitMQ
       try
       {
         _sendChannel?.BasicCancel(_consumerId);
-        _sendChannel.Close();
+        _sendChannel?.Close();
         _connection.Close();
       }
       catch

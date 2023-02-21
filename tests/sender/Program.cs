@@ -15,17 +15,19 @@ IHost host = Host.CreateDefaultBuilder(args)
       opt.SetAsRemoteRequest<MediatRRequest1>();
       opt.SetAsRemoteRequest<MediatRRequest2>();
       opt.SetAsRemoteRequest<MediatRRequest3>();
+      opt.SetAsRemoteRequest<MediatRRequest4>();
+      opt.SetAsRemoteRequest<MediatRRequest5>();
       opt.SetAsRemoteRequest<MediatRRequestWithException>();
       opt.SetAsRemoteRequest<MediatRRequestWithHandlerException>();
       opt.SetAsRemoteRequest<MediatRRequestWithNoHandlers>();
       opt.PropagateNotification<MediatorNotification1>();
     });
-    services.AddArbitrerRabbitMQMessageDispatcher(opt => context.Configuration.GetSection("rabbitmq").Bind(opt));
+    // services.AddArbitrerRabbitMQMessageDispatcher(opt => context.Configuration.GetSection("rabbitmq").Bind(opt));
+    services.AddArbitrerKafkaMessageDispatcher(opt => context.Configuration.GetSection("kafka").Bind(opt));
 
     services.AddHostedService<Worker>();
   })
   .Build();
-
 
 
 await host.RunAsync();

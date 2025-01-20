@@ -22,18 +22,23 @@ namespace Arbitrer.RabbitMQ
   {
     private readonly MessageDispatcherOptions options;
     private readonly ILogger<MessageDispatcher> logger;
+    private readonly ArbitrerOptions arbitrerOptions;
     private IConnection _connection = null;
     private IModel _sendChannel = null;
     private string _replyQueueName = null;
     private AsyncEventingBasicConsumer _sendConsumer = null;
     private string _consumerId = null;
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _callbackMapper = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
+
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _callbackMapper =
+      new ConcurrentDictionary<string, TaskCompletionSource<string>>();
 
 
-    public MessageDispatcher(IOptions<MessageDispatcherOptions> options, ILogger<MessageDispatcher> logger)
+    public MessageDispatcher(IOptions<MessageDispatcherOptions> options,
+      ILogger<MessageDispatcher> logger, IOptions<ArbitrerOptions> arbitrerOptions)
     {
       this.options = options.Value;
       this.logger = logger;
+      this.arbitrerOptions = arbitrerOptions.Value;
 
       this.InitConnection();
     }
@@ -52,13 +57,14 @@ namespace Arbitrer.RabbitMQ
           VirtualHost = options.VirtualHost,
           Port = options.Port,
           DispatchConsumersAsync = true,
+          ClientProvidedName = options.ClientName
         };
 
         _connection = factory.CreateConnection();
       }
 
       _sendChannel = _connection.CreateModel();
-      _sendChannel.ExchangeDeclare(Consts.ArbitrerExchangeName, ExchangeType.Topic);
+      _sendChannel.ExchangeDeclare(Constants.ArbitrerExchangeName, ExchangeType.Topic);
       // _channel.ConfirmSelect();
 
       var queueName = $"{options.QueueName}.{Process.GetCurrentProcess().Id}.{DateTime.Now.Ticks}";
@@ -66,7 +72,7 @@ namespace Arbitrer.RabbitMQ
       _sendConsumer = new AsyncEventingBasicConsumer(_sendChannel);
       _sendConsumer.Received += (s, ea) =>
       {
-        if (!_callbackMapper.TryRemove(ea.BasicProperties.CorrelationId, out TaskCompletionSource<string> tcs))
+        if (!_callbackMapper.TryRemove(ea.BasicProperties.CorrelationId, out var tcs))
           return Task.CompletedTask;
         var body = ea.Body.ToArray();
         var response = Encoding.UTF8.GetString(body);
@@ -76,7 +82,7 @@ namespace Arbitrer.RabbitMQ
 
       _sendChannel.BasicReturn += (s, ea) =>
       {
-        if (!_callbackMapper.TryRemove(ea.BasicProperties.CorrelationId, out TaskCompletionSource<string> tcs)) return;
+        if (!_callbackMapper.TryRemove(ea.BasicProperties.CorrelationId, out var tcs)) return;
         tcs.TrySetException(new Exception($"Unable to deliver required action: {ea.RoutingKey}"));
       };
 
@@ -94,12 +100,12 @@ namespace Arbitrer.RabbitMQ
       _callbackMapper.TryAdd(correlationId, tcs);
 
       _sendChannel.BasicPublish(
-        exchange: Consts.ArbitrerExchangeName,
-        routingKey: typeof(TRequest).TypeQueueName(),
+        exchange: Constants.ArbitrerExchangeName,
+        routingKey: typeof(TRequest).TypeQueueName(arbitrerOptions),
         mandatory: true,
         body: Encoding.UTF8.GetBytes(message),
         basicProperties: GetBasicProperties(correlationId));
-      
+
       cancellationToken.Register(() => _callbackMapper.TryRemove(correlationId, out var tmp));
       var result = await tcs.Task;
 
@@ -110,15 +116,15 @@ namespace Arbitrer.RabbitMQ
     {
       var message = JsonConvert.SerializeObject(request, options.SerializerSettings);
 
-      logger.LogInformation($"Sending message to: {Consts.ArbitrerExchangeName}/{request.GetType().TypeQueueName()}");
+      logger.LogInformation($"Sending message to: {Constants.ArbitrerExchangeName}/{request.GetType().TypeQueueName(arbitrerOptions)}");
 
       _sendChannel.BasicPublish(
-        exchange: Consts.ArbitrerExchangeName,
-        routingKey: request.GetType().TypeQueueName(),
+        exchange: Constants.ArbitrerExchangeName,
+        routingKey: request.GetType().TypeQueueName(arbitrerOptions),
         mandatory: false,
         body: Encoding.UTF8.GetBytes(message)
       );
-      
+
       return Task.CompletedTask;
     }
 

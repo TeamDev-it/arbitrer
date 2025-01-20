@@ -1,5 +1,7 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,172 +18,328 @@ using RabbitMQ.Client.Events;
 
 namespace Arbitrer.RabbitMQ
 {
+  /// <summary>
+  /// The RequestsManager class is responsible for managing requests and notifications in a distributed system. It implements the IHostedService interface.
+  /// </summary>
   public class RequestsManager : IHostedService
   {
-    private readonly ILogger<RequestsManager> logger;
-    private readonly IArbitrer arbitrer;
-    private readonly IServiceProvider provider;
+    private ArbitrerOptions _arbitrerOptions;
 
+    /// <summary>
+    /// Represents the logger for the RequestsManager class.
+    /// </summary>
+    /// <typeparam name="RequestsManager">The type of the class using the logger.</typeparam>
+    private readonly ILogger<RequestsManager> _logger;
+
+    /// <summary>
+    /// The private readonly field that holds an instance of the IArbitrer interface.
+    /// </summary>
+    private readonly IArbitrer _arbitrer;
+
+    /// <summary>
+    /// Represents a service provider.
+    /// </summary>
+    private readonly IServiceProvider _provider;
+
+    /// <summary>
+    /// Represents a private instance of an IConnection object.
+    /// </summary>
     private IConnection _connection = null;
-    private IModel _channel = null;
 
-    private readonly HashSet<string> _deduplicationcache = new HashSet<string>();
+    /// <summary>
+    /// Represents the channel used for communication.
+    /// </summary>
+    private IChannel _channel = null;
+
+    // private Thread _watchguard = null;
+
+    private Dictionary<Type, AsyncEventingBasicConsumer> _consumers = new Dictionary<Type, AsyncEventingBasicConsumer>();
+
+    /// <summary>
+    /// Represents a SHA256 hash algorithm instance used for hashing data.
+    /// </summary>
     private readonly SHA256 _hasher = SHA256.Create();
 
-    private readonly MessageDispatcherOptions options;
+    /// <summary>
+    /// Represents the options for the message dispatcher.
+    /// </summary>
+    private readonly MessageDispatcherOptions _options;
 
-    public RequestsManager(IOptions<MessageDispatcherOptions> options, ILogger<RequestsManager> logger, IArbitrer arbitrer, IServiceProvider provider)
+    /// <summary>
+    /// Constructs a new instance of the RequestsManager class.
+    /// </summary>
+    /// <param name="options">The options for the message dispatcher.</param>
+    /// <param name="logger">The logger to be used for logging.</param>
+    /// <param name="arbitrer">The object responsible for coordinating requests.</param>
+    /// <param name="provider">The service provider for resolving dependencies.</param>
+    public RequestsManager(IOptions<MessageDispatcherOptions> options, ILogger<RequestsManager> logger, IArbitrer arbitrer, IServiceProvider provider,
+      IOptions<ArbitrerOptions> arbitrerOptions)
     {
-      this.options = options.Value;
-      this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
-      this.arbitrer = arbitrer;
-      this.provider = provider;
+      this._arbitrerOptions = arbitrerOptions.Value;
+      this._options = options.Value;
+      this._logger = logger ?? throw new ArgumentNullException(nameof(logger));
+      this._arbitrer = arbitrer;
+      this._provider = provider;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Starts the asynchronous process of connecting to RabbitMQ and consuming messages from queues.
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
-      if (_connection == null)
+      await CheckConnection(cancellationToken);
+
+      await CheckRequestsConsumers(cancellationToken);
+
+      await ValidateConnectionQos(cancellationToken);
+
+      // _watchguard = new Thread(() => Watchguard()) { IsBackground = true };
+      // _watchguard.Start();
+    }
+
+    // private async void Watchguard()
+    // {
+    //   await Task.Delay(TimeSpan.FromMinutes(2));
+    //   while (true)
+    //   {
+    //     var torebind = new HashSet<Type>();
+    //
+    //     foreach (var k in _consumers)
+    //     {
+    //       if (!k.Value.IsRunning)
+    //       {
+    //         _logger.LogError($"Stopping consumer for {k.Key}: The consumer is stopped for {k.Value.ShutdownReason?.Exception?.Message ?? "unknown reason"}");
+    //         torebind.Add(k.Key);
+    //       }
+    //     }
+    //
+    //     foreach (var t in torebind)
+    //     {
+    //       if (_consumers.ContainsKey(t))
+    //         _consumers.Remove(t);
+    //     }
+    //
+    //     if (torebind.Any())
+    //     {
+    //       await CheckConnection(CancellationToken.None);
+    //       await CheckRequestsConsumers(CancellationToken.None);
+    //       await ValidateConnectionQos(CancellationToken.None);
+    //     }
+    //
+    //
+    //     torebind.Clear();
+    //     await Task.Delay(TimeSpan.FromMinutes(2));
+    //   }
+    // }
+
+    private async Task CheckRequestsConsumers(CancellationToken cancellationToken)
+    {
+      foreach (var t in _arbitrer.GetLocalRequestsTypes())
       {
-        logger.LogInformation($"ARBITRER: Creating RabbitMQ Conection to '{options.HostName}'...");
-        var factory = new ConnectionFactory
+        if (t is null) continue;
+        var isNotification = t.IsNotification();
+        var isDurableNotification = isNotification && _arbitrerOptions.QueueNames.ContainsKey(t);
+        var queueName = t.ArbitrerQueueName(_arbitrerOptions);
+
+        var arguments = new Dictionary<string, object>();
+        var timeout = t.QueueTimeout();
+        if (timeout != null)
         {
-          HostName = options.HostName,
-          UserName = options.UserName,
-          Password = options.Password,
-          VirtualHost = options.VirtualHost,
-          Port = options.Port,
-          DispatchConsumersAsync = true,
-        };
-
-        _connection = factory.CreateConnection();
-        _channel = _connection.CreateModel();
-        _channel.ExchangeDeclare(Consts.ArbitrerExchangeName, ExchangeType.Topic);
-
-        logger.LogInformation($"ARBITRER: ready !");
-      }
+          arguments.Add("x-consumer-timeout", timeout);
+        }
 
 
-      foreach (var t in arbitrer.GetLocalRequestsTypes())
-      {
-        var isNotification = typeof(INotification).IsAssignableFrom(t);
-        var queuename = $"{t.TypeQueueName()}${(isNotification ? Guid.NewGuid().ToString() : "")}";
-
-        _channel.QueueDeclare(queue: queuename, durable: options.Durable, exclusive: isNotification, autoDelete: options.AutoDelete, arguments: null);
-        _channel.QueueBind(queuename, Consts.ArbitrerExchangeName, t.TypeQueueName());
+        await _channel.QueueDeclareAsync(queue: queueName, durable: _options.Durable,
+          exclusive: isNotification && !isDurableNotification,
+          autoDelete: _options.AutoDelete, arguments: arguments, cancellationToken: cancellationToken);
+        await _channel.QueueBindAsync(queueName, Constants.ArbitrerExchangeName, t.ArbitrerTypeName(_arbitrerOptions), cancellationToken: cancellationToken);
 
 
         var consumer = new AsyncEventingBasicConsumer(_channel);
+        _consumers.Add(t, consumer);
 
-        var consumermethod = typeof(RequestsManager)
-          .GetMethod(isNotification ? "ConsumeChannelNotification" : "ConsumeChannelMessage", BindingFlags.Instance | BindingFlags.NonPublic)
+        var consumerMethod = typeof(RequestsManager)
+          .GetMethod(isNotification ? nameof(ConsumeChannelNotification) : nameof(ConsumeChannelMessage), BindingFlags.Instance | BindingFlags.NonPublic)?
           .MakeGenericMethod(t);
 
-        consumer.Received += async (s, ea) =>
+
+        consumer.ReceivedAsync += async (s, ea) =>
         {
           try
           {
-            await (Task)consumermethod.Invoke(this, new object[] { s, ea });
+            if (consumerMethod != null)
+              await (Task)consumerMethod.Invoke(this, new object[] { s, ea });
           }
           catch (Exception e)
           {
-            logger.LogError(e,e.Message);
-            throw;
+            _logger.LogError(e, e.Message);
           }
         };
-        _channel.BasicConsume(queue: queuename, autoAck: isNotification, consumer: consumer);
-      }
 
-      _channel.BasicQos(0, 1, false);
-      return Task.CompletedTask;
+        await _channel.BasicConsumeAsync(queue: queueName, autoAck: isNotification, consumer: consumer, cancellationToken: cancellationToken);
+      }
     }
 
+    private async Task ValidateConnectionQos(CancellationToken cancellationToken)
+    {
+      try
+      {
+        if (_options.PerChannelQos == 0)
+        {
+          var qos = _arbitrer.GetLocalRequestsTypes().Count();
+          var maxMessages = qos * _options.PerConsumerQos > ushort.MaxValue ? ushort.MaxValue : (ushort)(qos * _options.PerConsumerQos);
+          _logger.LogInformation($"Configuring Qos for channels with: prefetch = 0 and fetch size = {maxMessages}");
+          await _channel.BasicQosAsync(0, maxMessages, true, cancellationToken: cancellationToken);
+        }
+        else
+        {
+          await _channel.BasicQosAsync(0, _options.PerChannelQos > ushort.MaxValue ? ushort.MaxValue : (ushort)_options.PerChannelQos, true,
+            cancellationToken: cancellationToken);
+        }
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError("Current RabbitMQ does not support Qos for channels");
+        _logger.LogError(ex.Message);
+        _logger.LogError(ex.StackTrace);
+      }
+
+      try
+      {
+        _logger.LogInformation($"Configuring Qos for consumers with: prefetch = 0 and fetch size = {Math.Max(_options.PerConsumerQos, (ushort)1)}");
+        await _channel.BasicQosAsync(0, Math.Max(_options.PerConsumerQos, (ushort)1), false, cancellationToken: cancellationToken);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError("Current RabbitMQ does not support Qos for consumers");
+        _logger.LogError(ex.Message);
+        _logger.LogError(ex.StackTrace);
+      }
+    }
+
+    private async Task CheckConnection(CancellationToken cancellationToken)
+    {
+      if (_connection != null && _connection.IsOpen)
+      {
+        _connection = null;
+      }
+
+      if (_connection == null)
+      {
+        _logger.LogInformation($"ARBITRER: Creating RabbitMQ Connection to '{_options.HostName}'...");
+        var factory = new ConnectionFactory
+        {
+          HostName = _options.HostName,
+          UserName = _options.UserName,
+          Password = _options.Password,
+          VirtualHost = _options.VirtualHost,
+          Port = _options.Port,
+
+          ClientProvidedName = _options.ClientName
+        };
+
+        _connection = await factory.CreateConnectionAsync(cancellationToken);
+        _channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
+
+        await _channel.ExchangeDeclareAsync(Constants.ArbitrerExchangeName, ExchangeType.Topic, cancellationToken: cancellationToken);
+
+        _logger.LogInformation("ARBITRER: ready !");
+      }
+    }
+
+
+    /// <summary>
+    /// ConsumeChannelNotification is a private asynchronous method that handles the consumption of channel notifications. </summary>
+    /// <typeparam name="T">The type of messages to be consumed</typeparam> <param name="sender">The object that triggered the event</param> <param name="ea">The event arguments containing the consumed message</param>
+    /// <returns>A Task representing the asynchronous operation</returns>
+    /// /
     private async Task ConsumeChannelNotification<T>(object sender, BasicDeliverEventArgs ea)
     {
-      var msg = ea.Body.ToArray();
-
-      if (options.DeDuplicationEnabled)
-      {
-        var hash = msg.GetHash(_hasher);
-        lock (_deduplicationcache)
-          if (_deduplicationcache.Contains(hash))
-          {
-            logger.LogDebug($"duplicated message received : {ea.Exchange}/{ea.RoutingKey}");
-            return;
-          }
-
-        lock (_deduplicationcache)
-          _deduplicationcache.Add(hash);
-
-        // Do not await this task
-#pragma warning disable CS4014
-        Task.Run(async () =>
-        {
-          await Task.Delay(options.DeDuplicationTTL);
-          lock (_deduplicationcache)
-            _deduplicationcache.Remove(hash);
-        });
-#pragma warning restore CS4014
-      }
-
-      logger.LogDebug("Elaborating notification : {0}", Encoding.UTF8.GetString(msg));
-      var message = JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(msg), options.SerializerSettings);
-
-      var replyProps = _channel.CreateBasicProperties();
-      replyProps.CorrelationId = ea.BasicProperties.CorrelationId;
-
-      var mediator = provider.CreateScope().ServiceProvider.GetRequiredService<IMediator>();
+      var mediator = _provider.CreateScope().ServiceProvider.GetRequiredService<IMediator>();
+      var arbitrer = mediator as ArbitredMediatr;
       try
       {
-        var arbitrer = mediator as ArbitredMediatr;
+        var msg = ea.Body.ToArray();
+
+        _logger.LogDebug("Elaborating notification : {0}", Encoding.UTF8.GetString(msg));
+        var message = JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(msg), _options.SerializerSettings);
+
         arbitrer?.StopPropagating();
         await mediator.Publish(message);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, $"Error executing message of type {typeof(T)} from external service");
+      }
+      finally
+      {
         arbitrer?.ResetPropagating();
       }
-      catch (Exception ex)
-      {
-        logger.LogError(ex, $"Error executing message of type {typeof(T)} from external service");
-      }
-      finally
-      {
-      }
     }
 
+    /// <summary>
+    /// Consumes a message from a channel and processes it asynchronously.
+    /// </summary>
+    /// <typeparam name="T">The type of the message being consumed.</typeparam>
+    /// <param name="sender">The object that raised the event.</param>
+    /// <param name="ea">An object that contains the event data.</param>
+    /// <returns>A task representing the asynchronous processing of the message.</returns>
+    /// <remarks>
+    /// This method deserializes the message using the specified <c>DeserializerSettings</c>,
+    /// sends it to the mediator for processing, and publishes a response message to the
+    /// specified reply-to queue. If an exception occurs during processing, an error response
+    /// message will be published.
+    /// </remarks>
     private async Task ConsumeChannelMessage<T>(object sender, BasicDeliverEventArgs ea)
     {
-      var msg = ea.Body.ToArray();
-      logger.LogDebug("Elaborating message : {0}", Encoding.UTF8.GetString(msg));
-      var message = JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(msg), options.SerializerSettings);
-
-      var replyProps = _channel.CreateBasicProperties();
-      replyProps.CorrelationId = ea.BasicProperties.CorrelationId;
       string responseMsg = null;
+      var replyProps = new BasicProperties();
       try
       {
-        var mediator = provider.CreateScope().ServiceProvider.GetRequiredService<IMediator>();
+        replyProps.CorrelationId = ea.BasicProperties.CorrelationId;
+
+        var msg = ea.Body.ToArray();
+        _logger.LogDebug("Elaborating message : {0}", Encoding.UTF8.GetString(msg));
+        var message = JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(msg), _options.SerializerSettings);
+
+        var mediator = _provider.CreateScope().ServiceProvider.GetRequiredService<IMediator>();
         var response = await mediator.Send(message);
         responseMsg = JsonConvert.SerializeObject(new Messages.ResponseMessage { Content = response, Status = Messages.StatusEnum.Ok },
-          options.SerializerSettings);
-        logger.LogDebug("Elaborating sending response : {0}", responseMsg);
+          _options.SerializerSettings);
+        _logger.LogDebug("Elaborating sending response : {0}", responseMsg);
       }
       catch (Exception ex)
       {
-        responseMsg = JsonConvert.SerializeObject(new Messages.ResponseMessage { Exception = ex, Status = Messages.StatusEnum.Exception },
-          options.SerializerSettings);
-        logger.LogError(ex, $"Error executing message of type {typeof(T)} from external service");
+        responseMsg = JsonConvert.SerializeObject(new Messages.ResponseMessage
+          {
+            Exception = ex,
+            OriginaStackTrace = ex.StackTrace?.ToString(),
+            Status = Messages.StatusEnum.Exception, Content = Unit.Value
+          },
+          _options.SerializerSettings);
+        _logger.LogError(ex, $"Error executing message of type {typeof(T)} from external service");
       }
       finally
       {
-        _channel.BasicPublish(exchange: "", routingKey: ea.BasicProperties.ReplyTo, basicProperties: replyProps,
-          body: Encoding.UTF8.GetBytes(responseMsg ?? ""));
-        _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+        if (!string.IsNullOrWhiteSpace(ea.BasicProperties.ReplyTo))
+          await _channel.BasicPublishAsync(exchange: "", routingKey: ea.BasicProperties.ReplyTo, basicProperties: replyProps,
+            body: Encoding.UTF8.GetBytes(responseMsg ?? ""), mandatory: true);
+        await _channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
       }
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Stops the asynchronous operation and closes the channel and connection.
+    /// </summary>
+    /// <param name="cancellationToken">A <see cref="CancellationToken"/> used to cancel the operation.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
       try
       {
-        _channel?.Close();
+        _channel?.CloseAsync(cancellationToken);
       }
       catch
       {
@@ -189,13 +347,11 @@ namespace Arbitrer.RabbitMQ
 
       try
       {
-        _connection?.Close();
+        _connection?.CloseAsync(cancellationToken);
       }
       catch
       {
       }
-
-      return Task.CompletedTask;
     }
   }
 }

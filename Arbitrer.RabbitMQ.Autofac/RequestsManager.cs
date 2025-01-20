@@ -23,6 +23,7 @@ namespace Arbitrer.RabbitMQ
     private readonly ILogger<RequestsManager> _logger;
     private readonly IArbitrer _arbitrer;
     private readonly ILifetimeScope _provider;
+    private readonly ArbitrerOptions _arbitrerOptions;
 
     private IConnection _connection = null;
     private IModel _channel = null;
@@ -32,12 +33,14 @@ namespace Arbitrer.RabbitMQ
 
     private readonly MessageDispatcherOptions _options;
 
-    public RequestsManager(IOptions<MessageDispatcherOptions> options, ILogger<RequestsManager> logger, IArbitrer arbitrer, ILifetimeScope provider)
+    public RequestsManager(IOptions<MessageDispatcherOptions> options, ILogger<RequestsManager> logger,
+      IArbitrer arbitrer, ILifetimeScope provider, IOptions<ArbitrerOptions> arbitrerOptions)
     {
       this._options = options.Value;
       this._logger = logger ?? throw new ArgumentNullException(nameof(logger));
       this._arbitrer = arbitrer;
       this._provider = provider;
+      _arbitrerOptions = arbitrerOptions.Value;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -53,44 +56,47 @@ namespace Arbitrer.RabbitMQ
           VirtualHost = _options.VirtualHost,
           Port = _options.Port,
           DispatchConsumersAsync = true,
+          ClientProvidedName = _options.ClientName
         };
 
         _connection = factory.CreateConnection();
         _channel = _connection.CreateModel();
-        _channel.ExchangeDeclare(Consts.ArbitrerExchangeName, ExchangeType.Topic);
+        _channel.ExchangeDeclare(Constants.ArbitrerExchangeName, ExchangeType.Topic);
 
-        _logger.LogInformation($"ARBITRER: ready !");
+        _logger.LogInformation("ARBITRER: ready !");
       }
 
 
       foreach (var t in _arbitrer.GetLocalRequestsTypes())
       {
+        if (t is null) continue;
         var isNotification = typeof(INotification).IsAssignableFrom(t);
-        var queuename = $"{t.TypeQueueName()}${(isNotification ? Guid.NewGuid().ToString() : "")}";
+        var queueName = $"{t.TypeQueueName(_arbitrerOptions)}${(isNotification ? Guid.NewGuid().ToString() : "")}";
 
-        _channel.QueueDeclare(queue: queuename, durable: _options.Durable, exclusive: isNotification, autoDelete: _options.AutoDelete, arguments: null);
-        _channel.QueueBind(queuename, Consts.ArbitrerExchangeName, t.TypeQueueName());
+        _channel.QueueDeclare(queue: queueName, durable: _options.Durable, exclusive: isNotification, autoDelete: _options.AutoDelete, arguments: null);
+        _channel.QueueBind(queueName, Constants.ArbitrerExchangeName, t.TypeQueueName(_arbitrerOptions));
 
 
         var consumer = new AsyncEventingBasicConsumer(_channel);
 
-        var consumermethod = typeof(RequestsManager)
+        var consumerMethod = typeof(RequestsManager)
           .GetMethod(isNotification ? "ConsumeChannelNotification" : "ConsumeChannelMessage", BindingFlags.Instance | BindingFlags.NonPublic)
-          .MakeGenericMethod(t);
+          ?.MakeGenericMethod(t);
 
         consumer.Received += async (s, ea) =>
         {
           try
           {
-            await (Task)consumermethod.Invoke(this, new object[] { s, ea });
+            if (consumerMethod != null)
+              await (Task)consumerMethod.Invoke(this, new object[] { s, ea });
           }
           catch (Exception e)
           {
-            _logger.LogError(e,e.Message);
+            _logger.LogError(e, e.Message);
             throw;
           }
         };
-        _channel.BasicConsume(queue: queuename, autoAck: isNotification, consumer: consumer);
+        _channel.BasicConsume(queue: queueName, autoAck: isNotification, consumer: consumer);
       }
 
       _channel.BasicQos(0, 1, false);
@@ -132,8 +138,7 @@ namespace Arbitrer.RabbitMQ
       replyProps.CorrelationId = ea.BasicProperties.CorrelationId;
       try
       {
-        IMediator mediator = null;
-        if (!_provider.BeginLifetimeScope(MatchingScopeLifetimeTags.RequestLifetimeScopeTag).TryResolve<IMediator>(out mediator))
+        if (!_provider.BeginLifetimeScope(MatchingScopeLifetimeTags.RequestLifetimeScopeTag).TryResolve<IMediator>(out var mediator))
           mediator = _provider.BeginLifetimeScope().Resolve<IMediator>();
 
         var arbitrer = mediator as ArbitredMediatr;
@@ -144,9 +149,6 @@ namespace Arbitrer.RabbitMQ
       catch (Exception ex)
       {
         _logger.LogError(ex, $"Error executing message of type {typeof(T)} from external service");
-      }
-      finally
-      {
       }
     }
 
@@ -161,8 +163,7 @@ namespace Arbitrer.RabbitMQ
       string responseMsg = null;
       try
       {
-        IMediator mediator = null;
-        if (!_provider.BeginLifetimeScope(MatchingScopeLifetimeTags.RequestLifetimeScopeTag).TryResolve<IMediator>(out mediator))
+        if (!_provider.BeginLifetimeScope(MatchingScopeLifetimeTags.RequestLifetimeScopeTag).TryResolve<IMediator>(out var mediator))
           mediator = _provider.BeginLifetimeScope().Resolve<IMediator>();
 
         var response = await mediator.Send(message);

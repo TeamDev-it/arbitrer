@@ -9,55 +9,68 @@ using Newtonsoft.Json;
 
 namespace Arbitrer
 {
+  /// ArbitredMediatr class is a subclass of Mediator that adds additional functionality for remote request arbitration.
+  /// /
   public class ArbitredMediatr : Mediator
   {
-    private readonly IArbitrer arbitrer;
-    private readonly ILogger<ArbitredMediatr> logger;
-    private bool allowRemoteRequest = true;
+    private readonly IArbitrer _arbitrer;
+    private readonly ILogger<ArbitredMediatr> _logger;
+    private bool _allowRemoteRequest = true;
 
-    // public ArbitredMediatr(ServiceFactory serviceFactory, IArbitrer arbitrer, ILogger<ArbitredMediatr> logger) : base(serviceFactory)
-    // {
-    //   this.arbitrer = arbitrer;
-    //   this.logger = logger;
-    // }
-    
     public ArbitredMediatr(IServiceProvider serviceProvider, IArbitrer arbitrer, ILogger<ArbitredMediatr> logger) : base(serviceProvider)
     {
-      this.arbitrer = arbitrer;
-      this.logger = logger;
+      this._arbitrer = arbitrer;
+      this._logger = logger;
     }
 
+    /// <summary>
+    /// Stops the propagation of remote requests.
+    /// </summary>
     public void StopPropagating()
     {
-      allowRemoteRequest = false;
+      _allowRemoteRequest = false;
     }
 
+    /// <summary>
+    /// Resets the propagating state to allow remote requests.
+    /// </summary>
     public void ResetPropagating()
     {
-      allowRemoteRequest = true;
+      _allowRemoteRequest = true;
     }
 
-    protected override async Task PublishCore(IEnumerable<NotificationHandlerExecutor> handlerExecutors, INotification notification, CancellationToken cancellationToken)
+    /// <summary>
+    /// Publishes the given notification by invoking the registered notification handlers.
+    /// </summary>
+    /// <param name="handlerExecutors">The notification handler executors.</param>
+    /// <param name="notification">The notification to publish.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    protected override async Task PublishCore(IEnumerable<NotificationHandlerExecutor> handlerExecutors, INotification notification,
+      CancellationToken cancellationToken)
     {
-      if (allowRemoteRequest && arbitrer.HasRemoteHandler(notification.GetType()))
+      var not = notification;
+      string queueName = null;
+      if (typeof(IExplicitQueue).IsAssignableFrom(notification.GetType()))
       {
-        logger.LogDebug("Propagating: {Json}", JsonConvert.SerializeObject(notification));
-        await arbitrer.SendRemoteNotification(notification);
+        not = (notification as ExplicitQueueNotification<INotification>).Message;
+        queueName = (notification as IExplicitQueue).QueueName;
       }
-      else
-        await base.PublishCore(handlerExecutors, notification, cancellationToken);
-    }
 
-    // protected override async Task PublishCore(IEnumerable<Func<INotification, CancellationToken, Task>> allHandlers, INotification notification,
-    //   CancellationToken cancellationToken)
-    // {
-    //   if (allowRemoteRequest && arbitrer.HasRemoteHandler(notification.GetType()))
-    //   {
-    //     logger.LogDebug("Propagating: {Json}", JsonConvert.SerializeObject(notification));
-    //     await arbitrer.SendRemoteNotification(notification);
-    //   }
-    //   else
-    //     await base.PublishCore(allHandlers, notification, cancellationToken);
-    // }
+      try
+      {
+        if (_allowRemoteRequest)
+        {
+          await _arbitrer.SendRemoteNotification(not, queueName);
+        }
+        else
+          await base.PublishCore(handlerExecutors, not, cancellationToken);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, ex.Message);
+        throw;
+      }
+    }
   }
 }

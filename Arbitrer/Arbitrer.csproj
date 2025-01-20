@@ -17,7 +17,6 @@
     <Deterministic>true</Deterministic>
     <RootNamespace>Arbitrer</RootNamespace>
     <TargetFrameworks>netstandard2.0;net6.0</TargetFrameworks>
-    
     <RepositoryUrl>https://github.com/teamdev-it/arbitrer</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
@@ -28,11 +27,11 @@
     </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="MediatR" Version="12.*" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="7.*" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="7.*" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="7.*" />
-    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="7.*" />
-    <PackageReference Include="Newtonsoft.Json" Version="13.*" />
+    <PackageReference Include="MediatR" Version="12.4.1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>
